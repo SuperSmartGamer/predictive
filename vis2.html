@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SDG Visualizer</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; background: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', monospace; overflow: hidden; }
+        canvas { display: block; cursor: crosshair; position: absolute; top: 0; left: 0; }
+
+        #ui-layer {
+            position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+            width: 96%; max-width: 1100px;
+            background: rgba(13, 17, 23, 0.92);
+            padding: 14px 18px; border-radius: 12px;
+            border: 1px solid #30363d; backdrop-filter: blur(12px);
+            z-index: 10; pointer-events: auto;
+            display: flex; flex-direction: column; gap: 12px;
+        }
+
+        .stat-row { display: flex; gap: 10px; align-items: stretch; }
+        .stat-box {
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            min-width: 90px; padding: 6px 10px;
+            background: rgba(22,27,34,0.8); border-radius: 8px;
+            border: 1px solid #30363d;
+        }
+        .stat-label { font-size: 8px; color: #8b949e; letter-spacing: 1px; margin-bottom: 3px; text-transform: uppercase; }
+        .stat-val   { font-size: 20px; font-weight: bold; line-height: 1; }
+
+        #pred-box {
+            flex: 1; display: flex; align-items: center; justify-content: center; gap: 0;
+            background: rgba(22,27,34,0.8); border-radius: 8px; border: 1px solid #30363d;
+            padding: 6px 14px; min-width: 200px;
+        }
+        .digit-display { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+        .digit-label { font-size: 8px; color: #8b949e; letter-spacing: 1px; }
+        .digit-val   { font-size: 38px; font-weight: bold; line-height: 1; }
+        .digit-sep   { font-size: 24px; color: #444; margin: 0 16px; align-self: center; }
+        .verdict     { font-size: 28px; align-self: center; margin-left: 14px; }
+
+        #acc-sparkline { flex: 2; min-width: 120px; }
+
+        .controls { display: flex; align-items: center; gap: 12px; }
+        .btn {
+            background: #238636; color: white; border: none;
+            padding: 5px 12px; border-radius: 5px; cursor: pointer; font-size: 11px; white-space: nowrap;
+        }
+        .btn.secondary { background: #1f6feb; }
+        input[type=range] { accent-color: #58a6ff; }
+        #speed-label { font-size: 10px; color: #8b949e; white-space: nowrap; }
+        #buffer-status { color: #d2a8ff; font-size: 10px; white-space: nowrap; }
+
+        .legend { display: flex; gap: 16px; font-size: 10px; color: #8b949e; align-items: center; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+
+        #tooltip {
+            position: absolute; background: rgba(22,27,34,0.95);
+            border: 1px solid #58a6ff; border-radius: 6px;
+            padding: 8px 12px; font-size: 11px; pointer-events: none;
+            display: none; z-index: 20; line-height: 1.6;
+        }
+    </style>
+</head>
+<body>
+<div id="tooltip"></div>
+
+<div id="ui-layer">
+    <div class="stat-row">
+        <div class="stat-box"><span class="stat-label">Step</span><span class="stat-val" id="step-val" style="color:#58a6ff;font-size:16px">0</span></div>
+        <div class="stat-box"><span class="stat-label">Loss</span><span class="stat-val" id="loss-val" style="color:#ff7b72">0.000</span></div>
+        <div class="stat-box"><span class="stat-label">Roll Acc (200)</span><span class="stat-val" id="roll-acc-val" style="color:#f2cc60">—</span></div>
+        <div class="stat-box"><span class="stat-label">Val Acc (1000)</span><span class="stat-val" id="val-acc-val" style="color:#3fb950">—</span></div>
+        <div class="stat-box"><span class="stat-label">Synapses</span><span class="stat-val" id="syn-val" style="color:#d2a8ff;font-size:16px">—</span></div>
+        <div class="stat-box"><span class="stat-label">Swaps</span><span class="stat-val" id="swap-val" style="color:#79c0ff;font-size:16px">0</span></div>
+        <div class="stat-box" id="buffer-box"><span class="stat-label">Buffer</span><span id="buffer-status" style="font-size:11px">WAITING</span></div>
+
+        <div id="pred-box">
+            <div class="digit-display"><span class="digit-label">TRUE</span><span class="digit-val" id="true-digit" style="color:#f2cc60">?</span></div>
+            <span class="digit-sep">→</span>
+            <div class="digit-display"><span class="digit-label">PRED</span><span class="digit-val" id="pred-digit" style="color:#58a6ff">?</span></div>
+            <span class="verdict" id="verdict">⬜</span>
+        </div>
+        <svg id="acc-sparkline" height="54"></svg>
+    </div>
+
+    <div class="controls">
+        <button id="play-btn" class="btn">PAUSE</button>
+        <span id="speed-label">Speed: Live</span>
+        <input type="range" id="timeline-scrubber" value="0" min="0" max="0" style="flex:1">
+        <span id="buffer-status-inline" style="font-size:10px;color:#d2a8ff"></span>
+    </div>
+
+    <div class="legend">
+        <span><span class="dot" style="background:#ff8c00"></span>Retina (input)</span>
+        <span><span class="dot" style="background:#1e90ff"></span>Motor (output)</span>
+        <span><span class="dot" style="background:#00ff88"></span>Hidden (low surprise)</span>
+        <span><span class="dot" style="background:#ff0000"></span>Hidden (high surprise)</span>
+        <span style="margin-left:auto;color:#555">Surprise color = log-normalised raw per-node value</span>
+    </div>
+</div>
+
+<script>
+const CHUNK_SIZE = 5; 
+let metaIndex = [], chunkCache = new Map();
+let isPlaying = true;
+let currentGlobalStep = 0, maxAvailableStep = 0;
+let lastFrame = null;
+
+const SPARK_LEN = 300;
+let sparkHistory = [];           
+
+const canvas = d3.select("body").append("canvas");
+const ctx    = canvas.node().getContext("2d");
+let width = window.innerWidth, height = window.innerHeight;
+
+function resize() {
+    width = window.innerWidth; height = window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.attr("width", width * dpr).attr("height", height * dpr);
+    canvas.style("width", `${width}px`).style("height", `${height}px`);
+    ctx.scale(dpr, dpr);
+    if (lastFrame) drawFrame(lastFrame);
+}
+window.addEventListener("resize", resize);
+
+let transform = d3.zoomIdentity;
+const zoom = d3.zoom().scaleExtent([0.1, 50]).on("zoom", e => {
+    transform = e.transform;
+    if (lastFrame) drawFrame(lastFrame);
+});
+canvas.call(zoom);
+
+canvas.node().addEventListener("mousemove", e => {
+    if (!lastFrame) return;
+    const nodes = lastFrame.coords;
+    const mx = e.clientX, my = e.clientY;
+    let best = null, bestD = 15;
+    for (let i = 0; i < nodes.length; i++) {
+        const x = tx(nodes, i), y = ty(nodes, i);
+        const d = Math.hypot(x - mx, y - my);
+        if (d < bestD) { best = i; bestD = d; }
+    }
+    const tt = document.getElementById('tooltip');
+    if (best !== null) {
+        const surp  = (lastFrame.raw_surprises || lastFrame.node_surprises)[best];
+        const wsurp = lastFrame.node_surprises[best];
+        const type  = best < 10 ? "RETINA" : best < 20 ? `MOTOR (digit ${best-10})` : "HIDDEN";
+        tt.style.display = "block"; tt.style.left = (mx + 14) + "px"; tt.style.top = (my - 10) + "px";
+        tt.innerHTML = `<b>Node ${best}</b> · ${type}<br>Raw surprise: <b>${(surp||0).toFixed(4)}</b><br>Weighted surprise: <b>${(wsurp||0).toFixed(4)}</b>`;
+    } else {
+        tt.style.display = "none";
+    }
+});
+canvas.node().addEventListener("mouseleave", () => { document.getElementById('tooltip').style.display = "none"; });
+
+resize();
+
+const xScale = d3.scaleLinear(), yScale = d3.scaleLinear();
+
+function updateScales(nodes) {
+    const hidden = nodes.slice(20);
+    if (!hidden.length) return;
+    const xExt = d3.extent(hidden, d => d[2]);
+    const yExt = d3.extent(hidden, d => d[1]);
+    xScale.domain(xExt).range([160, width - 160]);
+    yScale.domain(yExt).range([height - 220, 80]);
+}
+
+function tx(nodes, i) { return transform.applyX(xScale(nodes[i][2])); }
+function ty(nodes, i) { return transform.applyY(yScale(nodes[i][1])); }
+
+const lowColor  = d3.rgb("#00ff88");
+const highColor = d3.rgb("#ff2200");
+
+function surpriseColor(val, maxVal) {
+    if (!maxVal || maxVal <= 0) return `rgb(${lowColor.r},${lowColor.g},${lowColor.b})`;
+    const t = Math.log1p(Math.abs(val)) / Math.log1p(maxVal);
+    const c = t <= 0 ? lowColor : d3.interpolateRgb(lowColor, highColor)(Math.min(t, 1));
+    const rgb = d3.rgb(c);
+    return `rgb(${rgb.r|0},${rgb.g|0},${rgb.b|0})`;
+}
+
+async function pollMeta() {
+    try {
+        const res = await fetch('telemetry/meta.json', { cache: "no-store" });
+        if (!res.ok) return;
+        const newMeta = await res.json();
+        if (newMeta.length > metaIndex.length) {
+            metaIndex = newMeta;
+            maxAvailableStep = metaIndex.length * CHUNK_SIZE - 1;
+            document.getElementById('timeline-scrubber').max = maxAvailableStep;
+            document.getElementById('buffer-status-inline').textContent = `${metaIndex.length} chunks | ${maxAvailableStep+1} steps`;
+        }
+    } catch (_) {}
+}
+
+async function ensureBuffer() {
+    if (!metaIndex.length) return;
+    const target = Math.floor(currentGlobalStep / CHUNK_SIZE);
+    const keep   = new Set([target, target+1, target+2, target+3]);
+    for (const k of chunkCache.keys()) if (!keep.has(k)) chunkCache.delete(k);
+    for (const id of keep) {
+        if (id < metaIndex.length && !chunkCache.has(id)) {
+            chunkCache.set(id, "PENDING");
+            try {
+                const res = await fetch(`telemetry/${metaIndex[id]}`, { cache: "force-cache" });
+                chunkCache.set(id, await res.json());
+            } catch (_) { chunkCache.delete(id); }
+        }
+    }
+}
+
+function updateSparkline() {
+    const svg  = d3.select("#acc-sparkline");
+    const bbox = svg.node().getBoundingClientRect();
+    const W = bbox.width, H = bbox.height || 54;
+    svg.selectAll("*").remove();
+    if (sparkHistory.length < 2) return;
+
+    const xS = d3.scaleLinear().domain([0, sparkHistory.length-1]).range([0, W]);
+    const yS = d3.scaleLinear().domain([0, 100]).range([H-2, 2]);
+
+    const lineRoll = d3.line().x((_,i)=>xS(i)).y(d=>yS(d.rolling_acc)).curve(d3.curveBasis);
+    const lineVal  = d3.line().x((_,i)=>xS(i)).y(d=>yS(d.val_acc)).curve(d3.curveStepAfter);
+
+    svg.append("path").datum(sparkHistory).attr("fill","none").attr("stroke","#f2cc60").attr("stroke-width",1.5).attr("d", lineRoll);
+    svg.append("path").datum(sparkHistory).attr("fill","none").attr("stroke","#3fb950").attr("stroke-width",1.5).attr("opacity",0.8).attr("d", lineVal);
+
+    svg.append("line").attr("x1",0).attr("x2",W).attr("y1",yS(80)).attr("y2",yS(80)).attr("stroke","#555").attr("stroke-dasharray","3,3").attr("stroke-width",1);
+    svg.append("text").attr("x",W-2).attr("y",yS(80)-3).attr("text-anchor","end").attr("fill","#555").attr("font-size","8px").text("80%");
+}
+
+function drawFrame(frame) {
+    lastFrame = frame;
+    ctx.clearRect(0, 0, width, height);
+
+    const nodes    = frame.coords;
+    const rawSurp  = frame.raw_surprises || frame.node_surprises;
+    const maxRaw   = Math.max(d3.max(rawSurp) || 0, 0.01);
+
+    updateScales(nodes);
+
+    ctx.lineWidth = 0.8;
+    for (let i = 0; i < nodes.length; i++) {
+        for (let j = i+1; j < nodes.length; j++) {
+            if (!frame.adjacency[i][j]) continue;
+            const w = (frame.node_surprises[i] + frame.node_surprises[j]) * 0.5;
+            ctx.strokeStyle = `rgba(255,255,255,${Math.min(0.08 + w * 0.3, 0.4)})`;
+            ctx.beginPath();
+            ctx.moveTo(tx(nodes,i), ty(nodes,i));
+            ctx.lineTo(tx(nodes,j), ty(nodes,j));
+            ctx.stroke();
+        }
+    }
+
+    for (let i = 0; i < nodes.length; i++) {
+        const x = tx(nodes, i), y = ty(nodes, i);
+        const r = i < 20 ? 9 : 6;
+
+        let color;
+        if (i < 10) {
+            color = "#ff8c00";  
+        } else if (i < 20) {
+            const motorIdx = i - 10;
+            if (motorIdx === frame.pred_label && motorIdx === frame.true_label) {
+                color = "#00ff44";   
+            } else if (motorIdx === frame.true_label) {
+                color = "#f2cc60";   
+            } else if (motorIdx === frame.pred_label) {
+                color = "#ff3333";   
+            } else {
+                color = "#1e90ff";   
+            }
+        } else {
+            color = surpriseColor(rawSurp[i], maxRaw);
+        }
+
+        if (i >= 20 && rawSurp[i] > maxRaw * 0.7) {
+            ctx.shadowColor = "#ff2200";
+            ctx.shadowBlur  = 12;
+        } else {
+            ctx.shadowBlur = 0;
+        }
+
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, 2*Math.PI);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        ctx.fillStyle = "#fff";
+        ctx.font = i < 20 ? "bold 8px sans-serif" : "7px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        if (i < 10) {
+            ctx.fillText("R" + i, x, y);
+        } else if (i < 20) {
+            ctx.fillText(String(i - 10), x, y);
+        } else if (rawSurp[i] > maxRaw * 0.4) {
+            ctx.fillText(rawSurp[i].toFixed(2), x, y);
+        }
+    }
+
+    document.getElementById('step-val').textContent     = frame.step;
+    document.getElementById('loss-val').textContent     = frame.loss.toFixed(4);
+    document.getElementById('roll-acc-val').textContent = (frame.rolling_acc ?? "—") + (frame.rolling_acc != null ? "%" : "");
+    document.getElementById('val-acc-val').textContent  = frame.val_acc.toFixed(1) + "%";
+    document.getElementById('syn-val').textContent      = frame.syn_count ?? "—";
+    document.getElementById('swap-val').textContent     = frame.swap_count ?? 0;
+
+    const trueL = frame.true_label ?? frame.label ?? "?";
+    const predL = frame.pred_label ?? "?";
+    const ok    = (trueL === predL);
+    document.getElementById('true-digit').textContent = trueL;
+    document.getElementById('pred-digit').textContent = predL;
+    document.getElementById('pred-digit').style.color = ok ? "#3fb950" : "#ff7b72";
+    document.getElementById('verdict').textContent     = ok ? "✅" : "❌";
+
+    if (frame.rolling_acc != null) {
+        sparkHistory.push({ rolling_acc: frame.rolling_acc, val_acc: frame.val_acc });
+        if (sparkHistory.length > SPARK_LEN) sparkHistory.shift();
+        updateSparkline();
+    }
+}
+
+// LIVE SYNC ENGINE - Auto skips frames to stay aligned with Python
+function gameLoop(timestamp) {
+    requestAnimationFrame(gameLoop);
+    
+    if (isPlaying && maxAvailableStep > 0) {
+        // If JS falls behind Python by more than 10 frames, fast forward to catch up
+        if (maxAvailableStep - currentGlobalStep > 10) {
+            currentGlobalStep = maxAvailableStep;
+        } else {
+            currentGlobalStep = Math.min(currentGlobalStep + 1, maxAvailableStep);
+        }
+        document.getElementById('timeline-scrubber').value = currentGlobalStep;
+    }
+    
+    const chunkId = Math.floor(currentGlobalStep / CHUNK_SIZE);
+    const frameId = Math.floor(currentGlobalStep % CHUNK_SIZE);
+    const chunk = chunkCache.get(chunkId);
+    
+    if (chunk && chunk !== "PENDING") {
+        const frame = chunk[frameId];
+        if (frame) {
+            drawFrame(frame);
+            document.getElementById('buffer-status').innerText = "● LIVE";
+            document.getElementById('buffer-status').style.color = "#3fb950";
+        }
+    } else {
+        document.getElementById('buffer-status').innerText = "○ BUFFERING";
+        document.getElementById('buffer-status').style.color = "#d2a8ff";
+    }
+}
+
+document.getElementById('play-btn').onclick = function() {
+    isPlaying = !isPlaying;
+    this.textContent = isPlaying ? "PAUSE" : "PLAY";
+};
+document.getElementById('timeline-scrubber').oninput = function() {
+    currentGlobalStep = +this.value;
+    if (lastFrame) drawFrame(lastFrame);
+};
+
+// Poll ultra-fast to match the new 5-chunk size
+setInterval(pollMeta, 100);
+setInterval(ensureBuffer, 100);
+pollMeta().then(() => { ensureBuffer(); requestAnimationFrame(gameLoop); });
+</script>
+</body>
+</html>
