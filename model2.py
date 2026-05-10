@@ -9,15 +9,32 @@ class SpatialDynamicGraph(nn.Module):
         self.state_dim = state_dim
         self.space_dim = space_dim
 
+        # 1 in 10 neurons are Transformers (Graph Attention)
+        self.tf_idx = [i for i in range(num_nodes) if i % 10 == 0]
+        self.mlp_idx = [i for i in range(num_nodes) if i % 10 != 0]
+        
+        num_tf = len(self.tf_idx)
+        num_mlp = len(self.mlp_idx)
+
         self.retina_compressor = nn.Linear(49, 10 * state_dim)
+        
+        # --- MLP Neurons (1096 Params per node) ---
         hidden_dim = 30
         mlp_input_dim = state_dim + space_dim
+        self.W1 = nn.Parameter(torch.randn(num_mlp, mlp_input_dim, hidden_dim) / math.sqrt(mlp_input_dim))
+        self.b1 = nn.Parameter(torch.zeros(num_mlp, hidden_dim))
+        self.W2 = nn.Parameter(torch.randn(num_mlp, hidden_dim, state_dim) / math.sqrt(hidden_dim))
+        self.b2 = nn.Parameter(torch.zeros(num_mlp, state_dim))
 
-        self.W1 = nn.Parameter(torch.randn(num_nodes, mlp_input_dim, hidden_dim) / math.sqrt(mlp_input_dim))
-        self.b1 = nn.Parameter(torch.zeros(num_nodes, hidden_dim))
-        self.W2 = nn.Parameter(torch.randn(num_nodes, hidden_dim, state_dim) / math.sqrt(hidden_dim))
-        self.b2 = nn.Parameter(torch.zeros(num_nodes, state_dim))
+        # --- Transformer/GAT Neurons (~1040 Params per node) ---
+        # Q, K, V, and Output projections
+        self.W_q = nn.Parameter(torch.randn(num_tf, state_dim, state_dim) / math.sqrt(state_dim))
+        self.W_k = nn.Parameter(torch.randn(num_tf, state_dim, state_dim) / math.sqrt(state_dim))
+        self.W_v = nn.Parameter(torch.randn(num_tf, state_dim, state_dim) / math.sqrt(state_dim))
+        self.W_o = nn.Parameter(torch.randn(num_tf, state_dim, state_dim) / math.sqrt(state_dim))
+        self.b_tf = nn.Parameter(torch.zeros(num_tf, state_dim))
 
+        # Graph State
         self.register_buffer('coords', torch.randn(num_nodes, space_dim) * 1.5)
         self.register_buffer('weights', torch.zeros(num_nodes, num_nodes))
         self.register_buffer('freqs', torch.zeros(num_nodes, num_nodes))
@@ -53,28 +70,54 @@ class SpatialDynamicGraph(nn.Module):
         self.weights[self.adjacency] = 0.5
         self.freqs[self.adjacency]   = 1.0
 
-    def mlp_forward(self, x):
-        h1 = torch.einsum('bnmd,ndh->bnmh', x, self.W1) + self.b1.unsqueeze(1)
-        h1 = torch.nn.functional.layer_norm(h1, [h1.size(-1)])
-        h1 = torch.nn.functional.leaky_relu(h1)
-        h2 = torch.einsum('bnmh,nhd->bnmd', h1, self.W2) + self.b2.unsqueeze(1)
-        return torch.tanh(h2)
-
     def compute_masked_energy(self, states):
         batch_size = states.shape[0]
         active_weights = self.weights * self.adjacency.float()
 
-        total_routed   = torch.einsum('nm,bmd->bnd', active_weights, states)
+        # Gather inputs for MLP nodes
+        total_routed = torch.einsum('nm,bmd->bnd', active_weights, states)
         direct_messages = active_weights.unsqueeze(0).unsqueeze(3) * states.unsqueeze(1)
-        masked_context  = total_routed.unsqueeze(2) - direct_messages
-
-        rel_pos       = (self.coords.unsqueeze(0) - self.coords.unsqueeze(1)).detach()
+        masked_context = total_routed.unsqueeze(2) - direct_messages
+        rel_pos = (self.coords.unsqueeze(0) - self.coords.unsqueeze(1)).detach()
         rel_pos_batch = rel_pos.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        mlp_input = torch.cat([masked_context, rel_pos_batch], dim=-1)
 
-        mlp_input  = torch.cat([masked_context, rel_pos_batch], dim=-1)
-        predictions = self.mlp_forward(mlp_input)
+        # FIX 1: Initialize predictions as a 4D tensor (Batch, Receiver, Sender, State)
+        predictions = torch.zeros(batch_size, self.num_nodes, self.num_nodes, self.state_dim, device=states.device)
+
+        # 1. Forward Pass: Standard MLP Neurons
+        # FIX 2: unsqueeze(0).unsqueeze(2) correctly broadcasts the bias over Batch and Sender dims
+        h1 = torch.einsum('bnmd,ndh->bnmh', mlp_input[:, self.mlp_idx], self.W1) + self.b1.unsqueeze(0).unsqueeze(2)
+        h1 = torch.nn.functional.layer_norm(h1, [h1.size(-1)])
+        h1 = torch.nn.functional.leaky_relu(h1)
+        h2 = torch.einsum('bnmh,nhd->bnmd', h1, self.W2) + self.b2.unsqueeze(0).unsqueeze(2)
+        predictions[:, self.mlp_idx] = torch.tanh(h2)
+
+        # 2. Forward Pass: Transformer (GAT) Neurons
+        if len(self.tf_idx) > 0:
+            # Q = self, K = neighbors, V = neighbors
+            q = torch.einsum('bnd,ndh->bnh', states[:, self.tf_idx], self.W_q) 
+            k = torch.einsum('bmd,thd->btmh', states, self.W_k) 
+            v = torch.einsum('bmd,thd->btmh', states, self.W_v) 
+            
+            # Scaled Dot-Product Attention
+            scores = torch.einsum('bth,btmh->btm', q, k) / math.sqrt(self.state_dim) 
+            
+            # Mask out non-adjacent nodes so attention is strictly spatial
+            mask = self.adjacency[self.tf_idx, :].unsqueeze(0) 
+            scores = scores.masked_fill(~mask, float('-inf'))
+            attn = torch.softmax(scores, dim=-1)
+            attn = torch.nan_to_num(attn, nan=0.0) 
+            
+            # Route V and Project Output
+            out = torch.einsum('btm,btmh->bth', attn, v) 
+            out = torch.einsum('bth,thd->btd', out, self.W_o) + self.b_tf.unsqueeze(0)
+            
+            # Assign to the 4D predictions tensor
+            predictions[:, self.tf_idx] = torch.tanh(out).unsqueeze(2).expand(-1, -1, self.num_nodes, -1)
+
+        # 3. Calculate Energy/Surprise
         target_states = states.unsqueeze(1)
-
         raw_surprise = ((target_states - predictions) ** 2).mean(dim=-1)
 
         energy_weights = torch.ones(self.num_nodes, device=states.device)
@@ -88,16 +131,13 @@ class SpatialDynamicGraph(nn.Module):
         raw_per_node = raw_surprise.mean(dim=0).mean(dim=1)
 
         return total_energy, per_node_surprise, raw_per_node
-
     @torch.no_grad()
     def partial_physics_step(self, states):
         state_corr = torch.einsum('bnd,bmd->nm', states, states) / (self.state_dim * states.shape[0])
-        
-        # THE SYMMETRY BREAKER: Injecting 1e-4 noise to prevent point collapse (0 distance)
         dist_vectors = self.coords.unsqueeze(1) - self.coords.unsqueeze(0)
         dist_vectors += torch.randn_like(dist_vectors) * 1e-4 
         
-        dist_matrix = torch.norm(dist_vectors, dim=2) + 1e-8
+        dist_matrix = torch.norm(dist_vectors + 1e-8, dim=2)
         direction   = dist_vectors / dist_matrix.unsqueeze(2)
 
         degree     = self.adjacency.float().sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -118,19 +158,21 @@ class SpatialDynamicGraph(nn.Module):
         delta = torch.clamp(delta, min=-0.02, max=0.02)
         self.coords[hidden_mask] += delta[hidden_mask]
 
-        # Symmetry breaker applied to Pauli Exclusion as well
+        # Optimized Pauli Exclusion
+        d_vecs = self.coords.unsqueeze(1) - self.coords.unsqueeze(0)
+        d_vecs += torch.randn_like(d_vecs) * 1e-4
         for _ in range(3):
-            d_vecs = self.coords.unsqueeze(1) - self.coords.unsqueeze(0)
-            d_vecs += torch.randn_like(d_vecs) * 1e-4
-            d_mat = torch.norm(d_vecs, dim=2) + 1e-8
+            d_mat = torch.norm(d_vecs + 1e-8, dim=2)
             dir_mat = d_vecs / d_mat.unsqueeze(2)
-            
             overlap = torch.relu(0.5 - d_mat)
             overlap.fill_diagonal_(0)
             correction = (dir_mat * overlap.unsqueeze(2)).sum(dim=1) * 0.5
             self.coords[hidden_mask] += correction[hidden_mask]
+            if _ < 2: 
+                d_vecs = self.coords.unsqueeze(1) - self.coords.unsqueeze(0)
+                d_vecs += torch.randn_like(d_vecs) * 1e-4
 
-    def continuous_step(self, clamped_indices, clamped_values, lr_state=0.5):
+    def continuous_step(self, clamped_indices, clamped_values, lr_state=0.5, do_physics=False):
         if self.current_states is None:
             batch_size = clamped_values.shape[0]
             self.current_states = torch.rand(batch_size, self.num_nodes, self.state_dim, device=clamped_values.device) * 0.1
@@ -141,13 +183,15 @@ class SpatialDynamicGraph(nn.Module):
             states[:, clamped_indices, :] = clamped_values
 
         energy, per_node_surprise, raw_per_node = self.compute_masked_energy(states)
-        grad = torch.autograd.grad(energy, states)[0]
-
-        grad = torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
-        grad = torch.clamp(grad, min=-1.0, max=1.0)
-
+        
+        if energy.requires_grad:
+            grad = torch.autograd.grad(energy, states)[0]
+            grad = torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+            grad = torch.clamp(grad, min=-1.0, max=1.0)
+            with torch.no_grad():
+                states.sub_(lr_state * grad)
+        
         with torch.no_grad():
-            states.sub_(lr_state * grad)
             states.clamp_(min=-5.0, max=5.0)
             states[:, clamped_indices, :] = clamped_values
 
@@ -156,27 +200,32 @@ class SpatialDynamicGraph(nn.Module):
             if var < 0.01:
                 states[:, self.hidden_idx, :] += torch.randn_like(hidden_states) * 0.1
 
-        self.partial_physics_step(states.detach())
+        if do_physics:
+            self.partial_physics_step(states.detach())
+            
         self.current_states = states
         return energy.item(), per_node_surprise.detach().cpu(), raw_per_node.detach().cpu()
 
     def inference_step(self, clamped_indices, clamped_values, states, lr_state=0.5):
-        states = states.detach().requires_grad_(True)
-        with torch.no_grad():
-            states[:, clamped_indices, :] = clamped_values
+        with torch.enable_grad():
+            states = states.detach().requires_grad_(True)
+            states_cloned = states.clone()
+            states_cloned[:, clamped_indices, :] = clamped_values
 
-        energy, _, _ = self.compute_masked_energy(states)
-        grad = torch.autograd.grad(energy, states)[0]
+            energy, _, _ = self.compute_masked_energy(states_cloned)
+            
+            if energy.requires_grad:
+                grad = torch.autograd.grad(energy, states)[0]
+                grad = torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+                grad = torch.clamp(grad, min=-1.0, max=1.0)
+            else:
+                grad = torch.zeros_like(states)
 
-        grad = torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
-        grad = torch.clamp(grad, min=-1.0, max=1.0)
+        new_states = states.detach() - (lr_state * grad)
+        new_states.clamp_(min=-5.0, max=5.0)
+        new_states[:, clamped_indices, :] = clamped_values
 
-        with torch.no_grad():
-            states.sub_(lr_state * grad)
-            states.clamp_(min=-5.0, max=5.0)
-            states[:, clamped_indices, :] = clamped_values
-
-        return states
+        return new_states
 
     def train_step_pure_pc(self, surprise_threshold=0.1):
         if self.current_states is None:
@@ -208,9 +257,11 @@ class SpatialDynamicGraph(nn.Module):
         self.weights[weak]   = 0.0
 
         new_dist = torch.cdist(self.coords, self.coords)
-        can_form = (new_dist < 3.0) & (~self.adjacency)
+        
+        # FIX: Increased distance to 4.0 and lowered correlation to 0.05 so spatial wiring works properly
+        can_form = (new_dist < 4.0) & (~self.adjacency)
         can_form.fill_diagonal_(False)
-        corr_mask = can_form & (state_corr > 0.1)
+        corr_mask = can_form & (state_corr > 0.05)
         self.adjacency[corr_mask] = True
         self.weights[corr_mask]   = 0.1
 

@@ -3,97 +3,205 @@ import json
 import os
 import shutil
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from collections import deque
 import time
-from model import SpatialDynamicGraph
-
-def compress_list(data, precision=3):
-    if isinstance(data, list): return [compress_list(x, precision) for x in data]
-    elif isinstance(data, float): return round(data, precision)
-    return data
+import random
+from model2 import SpatialDynamicGraph
 
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    graph = SpatialDynamicGraph(num_nodes=75, state_dim=16).to(device)
-    transform = transforms.Compose([transforms.Resize((7, 7)), transforms.ToTensor(), transforms.Lambda(lambda x: x.view(-1))])
-    train_loader = DataLoader(datasets.MNIST(root='./data', train=True, download=True, transform=transform), batch_size=64, shuffle=True)
+    print(f"[INIT] Device: {device}")
+    graph = SpatialDynamicGraph(num_nodes=150, state_dim=16).to(device)
 
-    # THE FIX: Setup Sharded Telemetry Directory
-    if os.path.exists('telemetry'):
-        shutil.rmtree('telemetry') # Clear old runs
-    os.makedirs('telemetry', exist_ok=True)
-    meta_index = []
-
-    print("Engine Running: SHARDED TELEMETRY ACTIVE. Memory safe.")
+    transform = transforms.Compose([
+        transforms.Resize((7, 7)),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x.view(-1))
+    ])
     
-    for epoch in range(15):
-        correct = total = 0
-        for batch_idx, (images, labels) in enumerate(train_loader):
-            images, labels = images.to(device), labels.to(device)
-            batch_size = images.size(0)
+    print("[INIT] Downloading and compressing Full MNIST Dataset...")
+    dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
 
-            retina_states = torch.tanh(graph.retina_compressor(images).view(batch_size, 10, 16))
-            motor_targets = torch.full((batch_size, 10, 16), -0.9, device=device)
-            for b in range(batch_size): motor_targets[b, labels[b], :] = 0.9
+    all_imgs_list = []
+    all_labels_list = []
+    
+    for img, lbl in dataset:
+        all_imgs_list.append(img)
+        all_labels_list.append(lbl)
+        
+    full_imgs = torch.stack(all_imgs_list).to(device)
+    full_labels = torch.tensor(all_labels_list, device=device)
 
-            do_capture = True # We can leave this True now!
+    VAL_SIZE = 100 
+    val_imgs = full_imgs[:VAL_SIZE]
+    val_labels = full_labels[:VAL_SIZE]
+    train_imgs = full_imgs[VAL_SIZE:]
+    train_labels = full_labels[VAL_SIZE:]
 
-            free_states, _ = graph.relax(graph.retina_idx, retina_states, max_steps=50, capture_history=False)
-            graph.free_states = free_states.clone()
+    print(f"[INIT] Continuous Validation Set: {len(val_imgs)} Images")
+    print(f"[INIT] Infinite Training Pool: {len(train_imgs)} Images")
+
+    comp_val_pixels  = graph.retina_compressor(val_imgs)
+    val_retina_states = torch.tanh(comp_val_pixels.view(VAL_SIZE, 10, 16))
+
+    if os.path.exists('telemetry'): shutil.rmtree('telemetry')
+    os.makedirs('telemetry', exist_ok=True)
+    meta_index  = []
+    chunk_frames = []
+
+    rolling_correct = deque(maxlen=200)
+    class_correct = {i: 0 for i in range(10)}
+    class_total   = {i: 0 for i in range(10)}
+
+    print(f"=== FULL MNIST GENERALIZATION ENGINE ===")
+
+    def get_random_stimulus():
+        idx = random.randint(0, len(train_imgs) - 1)
+        return {'id': idx, 'img': train_imgs[idx], 'label': int(train_labels[idx].item())}
+
+    current_stim = get_random_stimulus()
+    val_acc = 0.0
+    best_val_acc = 0.0
+    stability_counter = 0
+    STABILITY_THRESHOLD = 200
+    swap_count = 0
+    predicted_label = -1
+
+    t_start = time.time()
+    MAX_STEPS = 1_000_000 
+    
+    CHUNK_SIZE = 2 
+    
+    for step in range(MAX_STEPS):
+        comp_pixels = graph.retina_compressor(current_stim['img'].unsqueeze(0))
+        retina_states = torch.tanh(comp_pixels.view(1, 10, 16))
+
+        # 1. THE TRULY HONEST PREDICTION PEEK (Unclamped)
+        predicted_label = -1
+        is_correct = False
+        if graph.current_states is not None:
+            peek_states = graph.current_states.clone()
+            
+            # FIX: Scrub the motor nodes so it can't cheat by reading the previous step's clamped truth
+            peek_states[:, graph.motor_idx, :] = torch.randn(1, 10, graph.state_dim, device=device) * 0.1
+
+            for _ in range(5): 
+                peek_states = graph.inference_step(graph.retina_idx, retina_states, peek_states)
             
             with torch.no_grad():
-                logits = graph.free_states[:, graph.motor_idx, :].mean(dim=2)
-                _, predicted = torch.max(logits, 1)
-                total += labels.size(0); correct += (predicted == labels).sum().item()
-
-            clamped_states, p3_history = graph.relax(
-                graph.retina_idx + graph.motor_idx, 
-                torch.cat([retina_states, motor_targets], dim=1), 
-                max_steps=50, 
-                init_states=graph.free_states, 
-                capture_history=do_capture
-            )
-            graph.clamped_states = clamped_states.clone()
-
-            pc_loss, node_surprises = graph.train_step_pure_pc(surprise_threshold=0.5)
-            graph.physics_step()
-
-            # --- SHARDED LOGGING ---
-            batch_frames = []
-            
-            if do_capture:
-                for h in p3_history:
-                    s_surp = torch.nan_to_num(torch.tensor(h['surprises']), nan=0.0).tolist()
-                    s_coor = torch.nan_to_num(torch.tensor(h['coords']), nan=0.0).tolist()
-                    batch_frames.append({
-                        'epoch': epoch + 1, 'batch': batch_idx, 'substep': h['step'],
-                        'accuracy': round(100 * correct / total, 1), 
-                        'node_surprises': compress_list(s_surp, 3),
-                        'coords': compress_list(s_coor, 3), 
-                        'adjacency': graph.adjacency.detach().cpu().numpy().tolist()
-                    })
-            
-            # 1. Write the specific batch to its own file
-            filename = f"batch_{epoch+1}_{batch_idx:03d}.json"
-            filepath = os.path.join('telemetry', filename)
-            with open(filepath, 'w') as f:
-                json.dump(batch_frames, f)
+                motor_logits = peek_states[:, graph.motor_idx, :].mean(dim=2)
+                predicted_label = int(torch.argmax(motor_logits, dim=1).item())
+                true_label = int(current_stim['label'])
+                is_correct = (predicted_label == true_label)
                 
-            # 2. Update the Meta Index
+                rolling_correct.append(float(is_correct))
+                class_total[true_label]   += 1
+                class_correct[true_label] += int(is_correct)
+
+        rolling_acc = 100.0 * sum(rolling_correct) / max(len(rolling_correct), 1)
+
+        # 2. CLAMP AND TRAIN (Apply truth force)
+        motor_targets = torch.full((1, 10, 16), -0.9, device=device)
+        motor_targets[0, current_stim['label'], :] = 0.9
+
+        all_idx = graph.retina_idx + graph.motor_idx
+        all_vals = torch.cat([retina_states, motor_targets], dim=1)
+
+        _, _, _ = graph.continuous_step(all_idx, all_vals)
+        loss, surprises, raw_surprises = graph.train_step_pure_pc(surprise_threshold=0.1)
+
+        if step % 50 == 0:
+            graph.physics_step(decay_rate=0.005)
+
+        # 3. FULL BATCH VALIDATION PROBE 
+        if step % 50 == 0: # Reduced frequency to save computation
+            val_states = torch.rand(VAL_SIZE, graph.num_nodes, graph.state_dim, device=device) * 0.1
+            for _ in range(5): 
+                val_states = graph.inference_step(graph.retina_idx, val_retina_states, val_states)
+
+            with torch.no_grad():
+                logits = val_states[:, graph.motor_idx, :].mean(dim=2)
+                _, preds = torch.max(logits, 1)
+                val_acc = float((preds == val_labels).float().mean().item() * 100.0)
+                
+                # FIX: Save best model
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    torch.save(graph.state_dict(), 'best_model.pth')
+                    print(f"   [SAVED] New best model at {val_acc:.1f}% accuracy.")
+
+        # 4. HOMEOSTASIS SWAP 
+        if loss < 0.05 and val_acc > 70.0:
+            stability_counter += 1
+        else:
+            stability_counter = 0
+
+        if stability_counter >= STABILITY_THRESHOLD:
+            swap_count += 1
+            old_label = current_stim['label']
+            current_stim = get_random_stimulus()
+            print(f"[SWAP  {step:06d}] Stable #{swap_count:03d} | {old_label}→{current_stim['label']} | V-Acc: {val_acc:.1f}%")
+            stability_counter = 0
+
+        # 5. CONSOLE LOGGING
+        if step % 100 == 0 or step < 10:
+            elapsed = time.time() - t_start
+            syn_count = int(graph.adjacency.sum().item())
+            if raw_surprises is not None:
+                raw_np = raw_surprises.numpy()
+                worst_node  = int(raw_np.argmax())
+                worst_surp  = float(raw_np.max())
+                node_type   = ("RETINA" if worst_node < 10 else "MOTOR" if worst_node < 20 else "HIDDEN")
+            else:
+                worst_node, worst_surp, node_type = -1, 0.0, "?"
+
+            print(
+                f"[{step:06d}] {elapsed:6.0f}s | Tgt:{current_stim['label']} Pred:{predicted_label} {'✓' if is_correct else '✗'} | "
+                f"Roll:{rolling_acc:5.1f}% Val:{val_acc:5.1f}% | Loss:{loss:.4f} | Syns:{syn_count} | WorstNode:{worst_node}({node_type})"
+            )
+
+        # 6. TELEMETRY PACKAGING (Optimized list generation)
+        s_surp = torch.round(torch.nan_to_num(surprises, nan=0.0), decimals=3).tolist() if surprises is not None else [0.0]*graph.num_nodes
+        s_raw  = torch.round(torch.nan_to_num(raw_surprises, nan=0.0), decimals=3).tolist() if raw_surprises is not None else [0.0]*graph.num_nodes
+        s_coor = torch.round(torch.nan_to_num(graph.coords.detach().cpu(), nan=0.0), decimals=3).tolist()
+
+        chunk_frames.append({
+            'step':          int(step),
+            'rolling_acc':   float(rolling_acc),
+            'val_acc':       float(val_acc),
+            'loss':          float(torch.nan_to_num(torch.tensor(loss), nan=0.0).item()),
+            'true_label':    int(current_stim['label']),
+            'pred_label':    int(predicted_label),
+            'correct':       bool(is_correct),
+            'swap_count':    int(swap_count),
+            'node_surprises': s_surp,
+            'raw_surprises':  s_raw,
+            'coords':         s_coor,
+            'adjacency':      graph.adjacency.detach().cpu().numpy().tolist(),
+            'syn_count':      int(graph.adjacency.sum().item()),
+        })
+
+        if (step + 1) % CHUNK_SIZE == 0:
+            chunk_id = step // CHUNK_SIZE
+            filename = f"chunk_{chunk_id:04d}.json"
+            with open(os.path.join('telemetry', filename), 'w') as f:
+                json.dump(chunk_frames, f)
             meta_index.append(filename)
             with open(os.path.join('telemetry', 'meta.json.tmp'), 'w') as f:
                 json.dump(meta_index, f)
             
-            # Atomic replace the meta file (the only file the browser polls)
-            for _ in range(10):
+            max_retries = 10
+            for i in range(max_retries):
                 try:
                     os.replace(os.path.join('telemetry', 'meta.json.tmp'), os.path.join('telemetry', 'meta.json'))
                     break
-                except PermissionError:
-                    time.sleep(0.05)
-
-            if batch_idx % 10 == 0: 
-                print(f"E{epoch+1} B{batch_idx} | Acc: {100*correct/total:.2f}% | Syn: {graph.adjacency.sum().item()}")
+                except PermissionError as e:
+                    if i == max_retries - 1:
+                        print(f"[ERROR] Failed to update meta.json after {max_retries} attempts: {e}")
+                        raise
+                    time.sleep(0.1 * (i + 1)) 
+            
+            chunk_frames = []
 
 if __name__ == "__main__":
     main()

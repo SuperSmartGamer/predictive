@@ -71,7 +71,7 @@
         <div class="stat-box"><span class="stat-label">Step</span><span class="stat-val" id="step-val" style="color:#58a6ff;font-size:16px">0</span></div>
         <div class="stat-box"><span class="stat-label">Loss</span><span class="stat-val" id="loss-val" style="color:#ff7b72">0.000</span></div>
         <div class="stat-box"><span class="stat-label">Roll Acc (200)</span><span class="stat-val" id="roll-acc-val" style="color:#f2cc60">—</span></div>
-        <div class="stat-box"><span class="stat-label">Val Acc (1000)</span><span class="stat-val" id="val-acc-val" style="color:#3fb950">—</span></div>
+        <div class="stat-box"><span class="stat-label">Val Acc (100)</span><span class="stat-val" id="val-acc-val" style="color:#3fb950">—</span></div>
         <div class="stat-box"><span class="stat-label">Synapses</span><span class="stat-val" id="syn-val" style="color:#d2a8ff;font-size:16px">—</span></div>
         <div class="stat-box"><span class="stat-label">Swaps</span><span class="stat-val" id="swap-val" style="color:#79c0ff;font-size:16px">0</span></div>
         <div class="stat-box" id="buffer-box"><span class="stat-label">Buffer</span><span id="buffer-status" style="font-size:11px">WAITING</span></div>
@@ -102,7 +102,8 @@
 </div>
 
 <script>
-const CHUNK_SIZE = 5; 
+// FIX: Matched Python's output block size
+const CHUNK_SIZE = 50; 
 let metaIndex = [], chunkCache = new Map();
 let isPlaying = true;
 let currentGlobalStep = 0, maxAvailableStep = 0;
@@ -242,17 +243,27 @@ function drawFrame(frame) {
 
     updateScales(nodes);
 
-    ctx.lineWidth = 0.8;
+    // FIX: Canvas rendering optimization. Batch strokes by opacity buckets.
+    const numBuckets = 5;
+    const buckets = Array.from({length: numBuckets}, () => new Path2D());
+    
     for (let i = 0; i < nodes.length; i++) {
         for (let j = i+1; j < nodes.length; j++) {
             if (!frame.adjacency[i][j]) continue;
             const w = (frame.node_surprises[i] + frame.node_surprises[j]) * 0.5;
-            ctx.strokeStyle = `rgba(255,255,255,${Math.min(0.08 + w * 0.3, 0.4)})`;
-            ctx.beginPath();
-            ctx.moveTo(tx(nodes,i), ty(nodes,i));
-            ctx.lineTo(tx(nodes,j), ty(nodes,j));
-            ctx.stroke();
+            const opacity = Math.min(0.08 + w * 0.3, 0.4);
+            const bucketIdx = Math.min(Math.floor((opacity / 0.4) * numBuckets), numBuckets - 1);
+            
+            buckets[bucketIdx].moveTo(tx(nodes,i), ty(nodes,i));
+            buckets[bucketIdx].lineTo(tx(nodes,j), ty(nodes,j));
         }
+    }
+    
+    ctx.lineWidth = 0.8;
+    for(let k=0; k<numBuckets; k++) {
+        const baseOpacity = ((k+0.5) / numBuckets) * 0.4;
+        ctx.strokeStyle = `rgba(255,255,255,${baseOpacity})`;
+        ctx.stroke(buckets[k]);
     }
 
     for (let i = 0; i < nodes.length; i++) {
@@ -325,12 +336,10 @@ function drawFrame(frame) {
     }
 }
 
-// LIVE SYNC ENGINE - Auto skips frames to stay aligned with Python
 function gameLoop(timestamp) {
     requestAnimationFrame(gameLoop);
     
     if (isPlaying && maxAvailableStep > 0) {
-        // If JS falls behind Python by more than 10 frames, fast forward to catch up
         if (maxAvailableStep - currentGlobalStep > 10) {
             currentGlobalStep = maxAvailableStep;
         } else {
@@ -365,7 +374,6 @@ document.getElementById('timeline-scrubber').oninput = function() {
     if (lastFrame) drawFrame(lastFrame);
 };
 
-// Poll ultra-fast to match the new 5-chunk size
 setInterval(pollMeta, 100);
 setInterval(ensureBuffer, 100);
 pollMeta().then(() => { ensureBuffer(); requestAnimationFrame(gameLoop); });
