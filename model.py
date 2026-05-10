@@ -14,11 +14,10 @@ class Pos():
 
 
 class Connection(nn.Module):
-    def __init__(self, to_node):
+    def __init__(self, to_node,embedding_dim):
         super(Connection, self).__init__()
         self.to_node = to_node
-        self.weight = nn.Parameter(torch.randn(16, 16))
-        self.dist=5
+        self.weight = nn.Parameter(torch.randn(embedding_dim,embedding_dim))
     def forward(self, input_state):
         # Placeholder
         return input_state @ self.weight
@@ -39,8 +38,9 @@ class Node(nn.Module):
             nn.Linear(30, 16),
             nn.LayerNorm(16)
         )
+        
         self.id=id
-        self.connections = []
+        self.connections =[]
         self.pos=pos
         self.state_dim = 16
         self.state = State(self)
@@ -61,6 +61,9 @@ class Node(nn.Module):
     def get_bucket(self, bucket_size):
         return Pos(int(self.pos.x // bucket_size), int(self.pos.y // bucket_size))
     
+    def add_connection(self, to):
+        self.connections.append(Connection(to,self.state_dim))
+
 class TiledGraph(nn.Module):
     def __init__(self):
         super(TiledGraph, self).__init__()
@@ -78,14 +81,6 @@ class TiledGraph(nn.Module):
         self.num_nodes += 1
 
 
-    def add_connection(self, from_idx, to_idx):
-        if from_idx < self.num_nodes and to_idx < self.num_nodes:
-            connection = Connection(to_node=to_idx)
-            self.nodes[from_idx].connections.append(connection)
-            self.adjacency[from_idx, to_idx] = 1.0
-
-    
-
     def bucketize(self):
         for v in self.nodes.values():
             c = v.get_bucket(self.bucket_size)
@@ -97,3 +92,14 @@ class TiledGraph(nn.Module):
             self.buckets[key].add(v.id)
             #self.buckets[v.id]=key
             v.bucket=key
+
+class Model(nn.Module):
+    def __init__(self, node_count:int):
+        super().__init__()
+        self.graph=TiledGraph()
+
+        for x in range(node_count):
+            self.graph.create_node(torch.randn(0,100))
+        for key in self.graph.nodes.keys():
+            for node in self.graph.nodes.values():
+                node.add_connection(key)
