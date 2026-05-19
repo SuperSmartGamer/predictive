@@ -1,2 +1,4 @@
 string="hello World"
-print(
+
+def hello_world:
+    print h

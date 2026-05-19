@@ -46,7 +46,9 @@ class Node(nn.Module):
         self.state = State(self)
         self.stateProjection = nn.Linear(self.state.shape[0], 16)
         self.bucket=[]
-
+        
+    def calculate_Loss():
+        pass
     def forwardNetwork(self, input_state):
         out=self.stateProjection(input_state)
         return self.network(out+input_state)
@@ -103,3 +105,4 @@ class Model(nn.Module):
         for key in self.graph.nodes.keys():
             for node in self.graph.nodes.values():
                 node.add_connection(key)
+            
